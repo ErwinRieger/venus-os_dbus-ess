@@ -59,13 +59,12 @@ class ESS(object):
         battservices = self._get_connected_service_list(classfilter="com.victronenergy.battery")
         assert(len(battservices) > 0)
 
-        if len(battservices) > 1:
-            logging.info("Warning: MORE than one battery service found!")
-            assert(0)
+        for b in battservices:
+            if b.endswith(".aggregate"):
+                break
 
-        for i in battservices:
-            logging.info(f"battery service: {i}")
-            self.battserviceName = i
+        self.battserviceName = b
+        logging.info(f"using batteryservice: {b}")
 
         self._dbusservice = VeDbusService(servicename)
 
@@ -89,7 +88,10 @@ class ESS(object):
         self.loadSwitch = libmqtt.MqttSwitch("DynamicLoadSwitch", "cmnd/tasmota_exess_power/Dimmer", rate=1)
         self.loadSwitch.publish("0") # xxx errorhandling
 
-        self.ysum = 0
+        self.Kc = 1/500 # 250
+        self.Ki = 0.005 # 0.0025 # 0.0015
+
+        self.ysum = 45 / self.Ki
 
         self.pvavg = 0
         self.pbatt = 0
@@ -104,8 +106,8 @@ class ESS(object):
         # Do not run the load when input is connected to mains, in this case we have
         # not enough solar power to run the load.
         #
-        # acsource is 240 if ac input is not connected, 0 when input switch is closed
-        if not self.acsource:
+        # acsource is 240 if ac input is not connected, 0 (and or 1?) when input switch is closed
+        if self.acsource != 240:
 
             if (self.logtime % 10) == 0:
                 logging.info(f"***")
@@ -126,49 +128,49 @@ class ESS(object):
         ppv = self._dbusmonitor.get_value("com.victronenergy.system", "/Dc/Pv/Power") # - pself
 
         if ppv > self.pvavg:
-            self.pvavg = calculate_rtt(self.pvavg, ppv, scale=0.2)
+            self.pvavg = calculate_rtt(self.pvavg, ppv, scale=0.25)
         else:
-            self.pvavg = calculate_rtt(self.pvavg, ppv, scale=0.1)
+            self.pvavg = calculate_rtt(self.pvavg, ppv, scale=0.025)
 
         pbatt = self._dbusmonitor.get_value("com.victronenergy.system", "/Dc/Battery/Power") or 0
 
         pdest = 0
-        if not th:
-            if chgmode == 0: # bulk
+        # pdest = avgp
+        # self.pbatt = calculate_rtt(self.pbatt, pbatt, scale=0.1)
+        self.pbatt = calculate_rtt(self.pbatt, pbatt, scale=0.01)
+
+        if True: # not th:
+            if chgmode == 0 or chgmode == "bulk": # bulk
                 pdest = 0.75*self.pvavg
-            elif chgmode == 1: # balance
-                # pdest = 250
-                if pbatt <= 0:
-                    pdest = -pbatt*1.25
-                else:
-                    pdest = self.pbatt
+            elif chgmode == 1 or chgmode == "balancing": # balance
+                pdest = self.pbatt * -0.5 # min(abs(self.pbatt), 0.25*self.pvavg) # 100 # self.pbatt
+                # if self.pbatt < 0:
+                    # pdest *= 1.25
+                   # pdest = min(pbatt*0.5, 0.2*self.pvavg) # pbatt # pbatt * 0.5
+                   # pdest = 50 # self.pbatt
+                # else:
+                   # pdest = min(pbatt*-0.5, 100) # pbatt * 0.5
             elif chgmode == 2: # sink
                 pass
-            else: # 3 float
-                # pdest = 250
-                if pbatt <= 0:
-                    pdest = -pbatt*1.25
-                else:
-                    pdest = self.pbatt
+            else: # 3 float "floating"
+                pdest = self.pbatt * -0.5 # min(abs(self.pbatt), 0.25*self.pvavg) # 75 # self.pbatt
+                # if self.pbatt < 0:
+                    # pdest *= 1.25
+                   # pdest = min(pbatt*0.5, 0.2*self.pvavg) # pbatt # pbatt * 0.5
+                   # pdest = 50 # self.pbatt
+                # else:
+                   # pdest = min(pbatt*-0.5, 100) # pbatt * 0.5
 
-        self.pbatt = calculate_rtt(self.pbatt, pdest, scale=0.05)
-        pbattchg = int(self.pbatt)
+        pbattchg = pdest # int(self.pbatt)
 
-        battdsc = 0
-        if chgmode == 2: # sink
-            battdsc = 50
-
-        # p_avail = self.pvavg - powerconsumption - pbattchg + battdsc
-        e = self.pvavg - powerconsumption - pbattchg + battdsc
+        # p_avail = self.pvavg - powerconsumption - pbattchg
+        e = self.pvavg - powerconsumption - pbattchg
 
         maxout = 100
 
         self.ysum += e 
 
-        Kc = 1/500 # 250
-        Ki = 0.005 # 0.0025 # 0.0015
-
-        ymaxpos = maxout/Ki
+        ymaxpos = maxout/self.Ki
         ymaxneg = 0 # -ymaxpos/10
 
         if self.ysum > ymaxpos:
@@ -176,8 +178,8 @@ class ESS(object):
         elif self.ysum < ymaxneg:
             self.ysum = ymaxneg
 
-        yp = Kc * e 
-        yi = Ki*self.ysum
+        yp = self.Kc * e 
+        yi = self.Ki*self.ysum
 
         y = ( yp + yi )
 
@@ -185,8 +187,8 @@ class ESS(object):
 
         if (self.logtime % 10) == 0:
             logging.info(f"***")
-            logging.info(f"pbatt: {pbatt:.0f}, batt reserve: {self.pbatt:.0f}, pdest: {pdest:.0f}")
-            logging.info(f"p_avail {e:.0f} = pvavg {self.pvavg:.0f} - powerconsumption {powerconsumption:.0f} - pbattchg {pbattchg:.0f} + battdsc {battdsc:.0f}")
+            logging.info(f"pbatt: {pbatt:.0f}, pbatt avg: {self.pbatt:.0f}, pdest: {pdest:.0f}")
+            logging.info(f"p_avail {e:.0f} = pvavg {self.pvavg:.0f} - powerconsumption {powerconsumption:.0f} - pbattchg {pbattchg:.0f}")
             logging.info(f"th: {th}, state: {chgmode}, p_avail/e: {e:.0f}, yP: {yp:.2f}, yI: {yi:.2f}, out: {out}, ysum: {self.ysum} ({ymaxneg}..{ymaxpos})")
         self.logtime += 1
 
